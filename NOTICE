@@ -1,0 +1,25 @@
+FreeToken-Optimization
+
+This source snapshot is derived from FlashML-org/FreeToken:
+https://github.com/FlashML-org/FreeToken
+Upstream checkout: 0d652e73a452d014ac5441a15baa75348e9fcb0a
+
+Copyright 2026 FreeToken Authors.
+The original project, architecture, documentation and inherited code are the
+work of FreeToken Authors and their contributors. Their LICENSE, citations,
+acknowledgments and source attribution notices are retained.
+
+Local optimization experiments and documentation were developed in the
+Free_test workspace with user direction and Codex assistance during
+2026-09-30 through 2026-10-03. The appended README section identifies the
+changes, measurements and limits. Modified inherited source files carry a
+local-modification notice. This is a separate experimental repository,
+not an official FlashML-org release or an endorsement by upstream authors.
+
+Third-party provenance remains recorded in the respective source files,
+including vLLM, flash-linear-attention, SGLang/sgl_kernel and llama.cpp.
+Retain those notices when redistributing the corresponding code.
+
+Local tests, experimental result data, model checkpoints and Open WebUI
+deployment/account data are excluded from this source publication. The
+original files and experiment evidence remain in the local workspace.
