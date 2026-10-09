@@ -32,6 +32,7 @@ class ModelSpec:
     # "module:Class" turning the checkpoint's media into items; None: the family takes no multimodal input
     mm_processor: str | None = None
     encoders: tuple[EncoderSpec, ...] = ()
+    quant_config_factory: str | None = None
 
 
 # Multimodal wrappers store the text tower under model.language_model.
@@ -153,6 +154,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         # the checkpoint has no ``model.`` root
         checkpoint_roots=(("model.layers", "layers"), ("model.head", "head")),
         packed_modules_mapping=_EXPERTS_W123_PACKED,
+        quant_config_factory="build_quant_config",
         # the head, the KV compressors and the indexer's scorer ship bf16; the fp8 config has no modules_to_not_convert
         unquantized_modules=("head", "*.compressor.wkv", "*.compressor.wgate", "*.indexer.weights_proj"),
     ),
@@ -324,7 +326,8 @@ def checkpoint_quant_config(model_path: str, hf_config: Any, spec: ModelSpec):
 
     if spec.parse_config == "parse_gguf_config":
         return None
-    return QuantConfig.from_hf(
+    factory = QuantConfig.from_hf if spec.quant_config_factory is None else _load_attr(spec.module, spec.quant_config_factory)
+    return factory(
         hf_config,
         name_map=NameMap(roots=spec.checkpoint_roots, segments=spec.checkpoint_segments, packed=spec.packed_modules_mapping),
         unquantized=spec.unquantized_modules,

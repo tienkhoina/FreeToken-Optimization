@@ -65,6 +65,21 @@ class DSV4AttnMetadata(BaseAttnMetadata):
     table_rows: torch.Tensor | None = None
     # The backend's cached arange(window_size) (address-stable across the capture's life).
     window_ar: torch.Tensor | None = None
+    descriptor: torch.Tensor | None = None
+    window_snap: torch.Tensor | None = None
+    cu_seqlens_q_gpu: torch.Tensor | None = None
+
+    @property
+    def is_bucket_prefill(self) -> bool:
+        return self.descriptor is not None
+
+    @property
+    def valid_tokens(self):
+        return self.descriptor[:1]
+
+    @property
+    def prefix_length(self):
+        return self.descriptor[1:2]
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
         return self.last_indices[:bs]

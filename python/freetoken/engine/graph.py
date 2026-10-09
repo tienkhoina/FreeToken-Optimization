@@ -145,6 +145,17 @@ class GraphRunner:
         self.prefill_max_tokens = 0
 
     def capture_prefill(self, model, config, page_table):
+        if getattr(config.model_config, "dsv4_args", None) is not None:
+            if getattr(config, "dsv4_prefill_mode", "eager") == "bucket":
+                from .dsv4_prefill import Dsv4PrefillGraphs
+
+                self.dsv4_prefill = Dsv4PrefillGraphs(self, model, config)
+                self.prefill_max_tokens = max(token for token, _ in self.dsv4_prefill.shapes)
+                self.dsv4_prefill.capture_startup()
+                return
+            self.prefill_max_tokens = 0
+            logger.info_rank0("DeepSeek-V4 native MoE scheduling uses decode graphs; sparse prefill remains eager")
+            return
         if config.attention_backend == "qsa_sparse" and config.model_config.qwen4_args is not None:
             from .qwen_prefill import QwenPrefillGraphs
 
@@ -248,6 +259,8 @@ class GraphRunner:
         return graph, captured, logits
 
     def replay_prefill(self, batch):
+        if hasattr(self, "dsv4_prefill"):
+            return self.dsv4_prefill.replay(batch)
         if hasattr(self, "qwen_prefill"):
             return self.qwen_prefill.replay(batch)
         graph, captured, logits = self._stage_prefill(batch)
@@ -324,6 +337,8 @@ class GraphRunner:
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
         if batch.is_prefill:
+            if hasattr(self, "dsv4_prefill"):
+                return self.dsv4_prefill.can_use(batch)
             if hasattr(self, "qwen_prefill"):
                 return self.qwen_prefill.can_use(batch)
             return (batch.mm_embeds is None and batch.mm_gather_plan is None and batch.mm_block_ends is None
@@ -359,6 +374,9 @@ class GraphRunner:
         # free-before-alloc cannot reclaim this GPU memory. empty_cache() is left to the
         # caller / next capture (GraphRunner._capture_graphs already runs it).
         self.graph_map = {}
+        if hasattr(self, "dsv4_prefill"):
+            self.dsv4_prefill.destroy()
+            del self.dsv4_prefill
         if hasattr(self, "qwen_prefill"):
             if hasattr(self.qwen_prefill, "destroy"):
                 self.qwen_prefill.destroy()

@@ -120,6 +120,16 @@ class Block(BaseOP):
         x = self.hc_post(x, residual, post, comb)
         return x
 
+    def prefill_bucket(self, x, input_ids, metadata, positions):
+        residual = x
+        x, post, comb = self.hc_pre(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
+        x = self.attn.prefill_bucket(self.attn_norm.forward(x), metadata, positions)
+        x = self.hc_post(x, residual, post, comb)
+        residual = x
+        x, post, comb = self.hc_pre(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
+        x = self.ffn.forward(self.ffn_norm.forward(x), input_ids)
+        return self.hc_post(x, residual, post, comb)
+
 
 class Transformer(BaseOP):
     def __init__(self, args: DeepseekV4Args, quant_config=None, *, strategy: str = "offload", decode_target: str = "gpu", prefix: str = ""):
@@ -199,6 +209,13 @@ class Transformer(BaseOP):
         h = self.norm.forward(h)
         return self.head.forward(h[:, -1])
 
+    def prefill_bucket(self, input_ids, metadata, positions):
+        h = self.embed.forward(input_ids.view(-1)).view(1, -1, self.args.dim)
+        h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
+        for layer in self.layers.op_list:
+            h = layer.prefill_bucket(h, input_ids, metadata, positions)
+        return self.head.forward(self.norm.forward(self.hc_head(h))[0])
+
 
 class DeepseekV4ForCausalLM(BaseLLMModel):
     """Engine adapter: a registered :class:`BaseLLMModel` wrapping the DSV4 transformer.
@@ -232,6 +249,8 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
         input_ids = batch.input_ids.long()
         md = batch.attn_metadata
         if batch.is_prefill:
+            if getattr(md, "is_bucket_prefill", False):
+                return self.model.prefill_bucket(input_ids.view(1, -1), md, batch.positions.long())
             # Ragged batched prefill (bs >= 1): each request starts from its own cached_len.
             # A cold segment (start_pos == 0) re-seeds the compressor carry register inside its
             # own attention segment; a radix hit / chunk continuation (start_pos > 0) resumes it

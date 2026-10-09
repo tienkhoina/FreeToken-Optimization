@@ -6,11 +6,12 @@ import json
 import torch
 
 from freetoken.kernel.utils import load_jit
+from .schedule_profile import profile_rows
 
 
 @cache
 def schedule_module():
-    return load_jit("moe_schedule", cuda_files=["moe_schedule.cuh"],
+    return load_jit("moe_schedule", "token_buckets", cuda_files=["moe_schedule.cuh"],
                     cuda_wrappers=[("launch", "&MoeSchedule::run"), ("cpu_doorbell", "&MoeCpuDoorbell::run")])
 
 
@@ -20,7 +21,8 @@ class NativeMoeSchedule:
         self.fraction = torch.tensor([round(gpu_fraction * 65536)], device=cache.device, dtype=torch.int32)
         self.prefill_fraction = torch.tensor([round((gpu_fraction if prefill_fraction is None else prefill_fraction) * 65536)],
                                              device=cache.device, dtype=torch.int32)
-        self.fetch_table = torch.full((cache.num_experts + 1,), -1, dtype=torch.int32, device=cache.device)
+        self.token_buckets = torch.tensor([1], dtype=torch.int32, device=cache.device)
+        self.fetch_table = torch.full((1, cache.num_experts + 1), -1, dtype=torch.int32, device=cache.device)
         self.stats = torch.zeros(cache.num_layers, 4, dtype=torch.int64, device=cache.device)
         if profile is not None:
             with open(profile) as source:
@@ -33,12 +35,15 @@ class NativeMoeSchedule:
                                          or data.get("hidden") != executor.H or data.get("intermediate") != executor.I
                                          or data.get("cpu_isa") != executor.isa):
                 raise ValueError("schedule profile CPU ISA/worker count/expert dimensions differ; rerun calibration")
-            if data.get("query_tokens", 1) != 1:
-                raise ValueError("schedule profile must be the single-token calibration; use prefill fraction separately")
-            counts = data["recommend_fetch_counts"]
-            if len(counts) > cache.num_experts + 1 or any(not isinstance(value, int) or value < 0 or value > i for i, value in enumerate(counts)):
-                raise ValueError("invalid calibrated fetch counts")
-            self.fetch_table[:len(counts)] = torch.tensor(counts, device=cache.device, dtype=torch.int32)
+            if executor is not None:
+                for name in ("top_k", "activation", "swiglu_alpha", "swiglu_limit"):
+                    if name in data and data[name] != getattr(executor, name):
+                        raise ValueError(f"schedule profile {name} differs; rerun calibration")
+            rows = profile_rows(data, cache.num_experts)
+            self.token_buckets = torch.tensor([tokens for tokens, _ in rows], device=cache.device, dtype=torch.int32)
+            self.fetch_table = torch.full((len(rows), cache.num_experts + 1), -1, device=cache.device, dtype=torch.int32)
+            for index, (_, counts) in enumerate(rows):
+                self.fetch_table[index, :len(counts)] = torch.tensor(counts, device=cache.device, dtype=torch.int32)
         self.copy_stream = torch.cuda.Stream(device=cache.device)
         self.cpu_stream = torch.cuda.Stream(device=cache.device)
         self.route_ready = torch.cuda.Event()
@@ -64,9 +69,10 @@ class NativeMoeSchedule:
         self.launch(topk_ids, topk_weights, hit_ids, hit_w, fetch_ids, fetch_w, cpu_ids,
                     c.slot_for_id.view(-1), c.id_of_slot, c.usage, c.step.view(1), c.src_indices,
                     c.evict_slots, c.num_indices, counts, self.stats[layer_id],
-                    self.prefill_fraction if is_prefill else self.fraction, self.fetch_table,
+                    self.prefill_fraction if is_prefill else self.fraction, self.fetch_table, self.token_buckets,
                     full if valid_tokens is None else valid_tokens, c.num_experts, layer_id * c.num_experts,
-                    min(c.cache_size, 2 * c.num_experts) if is_prefill else c.cache_size)
+                    min(c.cache_size, 2 * c.num_experts) if is_prefill else c.cache_size,
+                    topk_ids.shape[0] if is_prefill else -1)
         c._pending_src_layer = layer_id
         c._pending_whole_layer = False
         return hit_ids, fetch_ids, cpu_ids, hit_w, fetch_w, counts

@@ -703,7 +703,25 @@ def parse_args(
     )
     parser.add_argument(
         "--moe-native-schedule", action="store_true", default=ServerArgs.moe_native_schedule,
-        help="Native routing with concurrent GPU hits, GPU fetched misses and CPU misses, for both prefill and decode.",
+        help="Native routing with concurrent GPU hits, GPU fetched misses and CPU misses; DeepSeek prefill graphs are selected separately.",
+    )
+    parser.add_argument(
+        "--dsv4-fuse-shared-expert", action="store_true", default=ServerArgs.dsv4_fuse_shared_expert,
+        help="Experimental DeepSeek-V4 shared gate/up fusion; validate numerical differences and latency on your hardware.",
+    )
+    parser.add_argument(
+        "--dsv4-prefill-mode", choices=["eager", "bucket"], default=ServerArgs.dsv4_prefill_mode,
+        help="DeepSeek NVFP4 prefill: eager or startup-captured token/context buckets for one request.",
+    )
+    parser.add_argument(
+        "--dsv4-prefill-buckets", type=lambda value: tuple(int(part) for part in value.split(',')),
+        default=ServerArgs.dsv4_prefill_buckets,
+        help="Increasing comma-separated token buckets, each a window-page multiple; default powers of two from 128 to the cap.",
+    )
+    parser.add_argument(
+        "--dsv4-prefill-context-buckets", type=lambda value: tuple(int(part) for part in value.split(',')),
+        default=ServerArgs.dsv4_prefill_context_buckets,
+        help="Increasing comma-separated context capacities; larger contexts fall back to eager. Default up to 8192.",
     )
     parser.add_argument(
         "--moe-gpu-miss-fraction", type=float, default=ServerArgs.moe_gpu_miss_fraction,

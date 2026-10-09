@@ -20,6 +20,7 @@ from tqdm import tqdm
 from freetoken.layers.quantization import QuantKind
 from freetoken.distributed import get_tp_info
 from freetoken.models.loader import drop_page_cache
+from freetoken.models.nvfp4_banks import Nvfp4ExpertSourceSpec
 
 from .args import DeepseekV4Args, load_args
 
@@ -59,15 +60,16 @@ def _weight_map(model_path: str) -> dict:
         return json.load(f)["weight_map"]
 
 
-def _dequant_fp8_block(weight: torch.Tensor, scale: torch.Tensor, block: int = 128) -> torch.Tensor:
-    """Dequantize 128x128 block-scaled FP8 (e4m3) to bf16.
-
-    scale is e8m0 exponent codes, ``value = 2^(code-127)`` (Triton FP8 GEMM convention).
-    Used for ``wo_a`` to match the reference's bf16 einsum.
-    """
+def _dequant_fp8_block(weight: torch.Tensor, scale: torch.Tensor, block: int = 128, *, scale_fmt: str = "ue8m0") -> torch.Tensor:
+    """Dequantize FP8 blocks using E8M0 codes or floating scale values for wo_a."""
     n, k = weight.shape
-    codes = scale.view(torch.uint8).to(torch.float32)
-    s = torch.exp2(codes - 127.0)
+    if scale_fmt == "ue8m0":
+        codes = scale.view(torch.uint8).to(torch.float32)
+        s = torch.exp2(codes - 127.0)
+    elif scale_fmt == "float":
+        s = scale.float()
+    else:
+        raise ValueError(f"Unsupported FP8 block scale format: {scale_fmt!r}")
     s = s.repeat_interleave(block, dim=0).repeat_interleave(block, dim=1)[:n, :k]
     return (weight.to(torch.float32) * s).to(torch.bfloat16)
 
@@ -104,6 +106,8 @@ def iter_weights(
         # fp8 linears declare the e8m0 block scale under the quant method's role name
         if reader.has(f"{src}.scale"):
             yield f"{dst}.weight_scale_inv", get(f"{src}.scale")
+        elif reader.has(f"{src}.weight_scale"):
+            yield f"{dst}.weight_scale_inv", get(f"{src}.weight_scale")
 
     try:
         yield "model.embed.weight", get("embed.weight")
@@ -122,7 +126,9 @@ def iter_weights(
             yield f"{m}.kv_norm.weight", get(f"{a}.kv_norm.weight")
             # wo_a: FP8 in the checkpoint, dequantized to bf16 (reference bf16 einsum).
             yield f"{m}.wo_a", _dequant_fp8_block(
-                get(f"{a}.wo_a.weight"), get(f"{a}.wo_a.scale")
+                get(f"{a}.wo_a.weight"),
+                get(f"{a}.wo_a.scale") if reader.has(f"{a}.wo_a.scale") else get(f"{a}.wo_a.weight_scale"),
+                scale_fmt="ue8m0" if reader.has(f"{a}.wo_a.scale") else "float",
             )
             yield from linear(f"{a}.wo_b", f"{m}.wo_b")
             yield f"{m}.attn_sink", get(f"{a}.attn_sink")
@@ -173,6 +179,25 @@ _PROJ_ROLE = {"w1": "gate", "w3": "up", "w2": "down"}
 _KIND_SUFFIX = {"weight": "", "scale": "_scale"}
 
 
+_NVFP4_EXPERT_SPEC = Nvfp4ExpertSourceSpec(
+    key_pattern=re.compile(
+        r"^layers\.(?P<layer>\d+)\.ffn\.experts\.(?P<expert>\d+)\."
+        r"(?P<proj>w1|w2|w3)\.(?P<kind>weight_packed|weight_scale|weight_global_scale)$"
+    ),
+    proj_to_role=_PROJ_ROLE,
+    layer_to_bank=lambda layer, config: layer if layer < config.num_layers else None,
+    desc="DeepSeek-V4 compressed-tensors NVFP4 experts",
+    kind_map={"weight_packed": "weight", "weight_global_scale": "weight_scale_2"},
+    global_reciprocal=True,
+)
+
+
+def nvfp4_expert_spec(model_path: str, config):
+    if get_tp_info().size > 1:
+        raise NotImplementedError("DeepSeek-V4 expert banks support TP=1 only")
+    return _NVFP4_EXPERT_SPEC
+
+
 def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, parallel: bool | None = False, workers: int = 8, chunk: int = 8 << 20):
     """Routed experts, one piece per expert: ``{gate, up, down}`` e2m1 pairs and their e8m0
     ``_scale`` companions (``w1`` / ``w3`` / ``w2``). The MTP layer's experts are skipped."""
@@ -212,4 +237,4 @@ def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, parallel: bo
     return per_expert_pieces(_serial(), locate, tensors_per_expert=6)
 
 
-__all__ = ["iter_weights", "iter_expert_pieces"]
+__all__ = ["iter_weights", "iter_expert_pieces", "nvfp4_expert_spec"]

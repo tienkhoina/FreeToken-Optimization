@@ -246,6 +246,45 @@ class Attention(BaseOP):
         out = torch.where(valid, blk + offset, -1)
         return out.unsqueeze(0).expand(bsz, -1, -1)
 
+    def prefill_bucket(self, x, metadata, positions):
+        from freetoken.kernel.triton.dsv4.prefill import store_rows
+
+        tokens = x.shape[1]
+        ratio, rd, win = self.compress_ratio, self.rope_head_dim, self.window_size
+        frequencies = self._freqs_cis.index_select(0, positions)
+        qr = self.q_norm.forward(self.wq_a.forward(x))
+        q = self.wq_b.forward(qr).unflatten(-1, (self.n_heads, self.head_dim))
+        q = rms_norm(q, None, self.eps)
+        apply_rotary_emb(q[..., -rd:], frequencies)
+        kv = self.kv_norm.forward(self.wkv.forward(x))
+        apply_rotary_emb(kv[..., -rd:], frequencies)
+        act_quant_fp8_inplace(kv[..., :-rd], 64)
+        store_rows(kv[0], self.attn.pool.window_pool[self.layer_id],
+                   metadata.window_snap.index_select(0, positions), metadata.valid_tokens)
+        valid = torch.arange(tokens, device=x.device) < metadata.valid_tokens
+        candidates = (positions[:, None] - win + 1).clamp_min(0) + torch.arange(win, device=x.device)
+        visible = valid[:, None] & (candidates <= positions[:, None])
+        safe = torch.where(visible, candidates, 0).long()
+        windows = torch.where(visible, metadata.window_snap[safe], -1).unsqueeze(0)
+        if ratio:
+            if self.indexer is not None:
+                blocks = self.indexer.prefill_bucket(x, qr, metadata, positions)
+            else:
+                block = torch.arange(metadata.full_snap.shape[1] // ratio, device=x.device)
+                live = valid[:, None] & (block[None, :] < (positions[:, None] + 1) // ratio)
+                blocks = torch.where(live, block[None, :], -1).unsqueeze(0)
+            self.compressor.prefill_bucket(x, metadata)
+            full = metadata.full_snap[0][blocks.clamp_min(0).long() * ratio]
+            compressed = torch.where(blocks >= 0, full // ratio, -1)
+            topk = torch.cat((windows, compressed), dim=-1).int()
+            counts = torch.where(valid, ((positions + 1) // ratio).clamp_max(blocks.shape[-1]), 0).int().view(1, tokens)
+        else:
+            topk, counts = windows.int(), None
+        o = self.attn.attend(q, self.layer_id, topk, win, self.attn_sink, self.softmax_scale,
+                             cmp_counts=counts, has_compression=bool(ratio))
+        apply_rotary_emb(o[..., -rd:], frequencies, True)
+        return self._wo(o, 1, tokens)
+
     def decode_step(
         self, x: torch.Tensor, pos: torch.Tensor, rows: torch.Tensor, cmp_stage_cap: int,
         wctx=None,

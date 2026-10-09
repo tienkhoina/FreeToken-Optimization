@@ -48,6 +48,8 @@ struct MoeScheduleParams {
     int64_t* stats;
     const int32_t* fraction;
     const int32_t* fetch_table;
+    const int32_t* token_buckets;
+    int policy_rows;
     const int32_t* valid_tokens;
     int tokens;
     int top_k;
@@ -55,6 +57,7 @@ struct MoeScheduleParams {
     int slots;
     int evict_limit;
     int base;
+    int policy_tokens;
 };
 
 __global__ void moe_schedule_kernel(const __grid_constant__ MoeScheduleParams p) {
@@ -99,7 +102,14 @@ __global__ void moe_schedule_kernel(const __grid_constant__ MoeScheduleParams p)
     if (threadIdx.x == 0) {
         const int fraction = max(0, min(65536, p.fraction[0]));
         nfetch = min(nmiss, static_cast<int>((static_cast<int64_t>(nmiss) * fraction + 32768) >> 16));
-        if (limit == 1 && p.fetch_table[nmiss] >= 0) nfetch = min(nmiss, p.fetch_table[nmiss]);
+        const int query_tokens = p.policy_tokens < 0 ? (limit == 1 ? 1 : 0) : p.policy_tokens;
+        for (int row = 0; query_tokens > 0 && row < p.policy_rows; ++row) {
+            if (query_tokens <= p.token_buckets[row]) {
+                const int fetch = p.fetch_table[row * (p.experts + 1) + nmiss];
+                if (fetch >= 0) nfetch = min(nmiss, fetch);
+                break;
+            }
+        }
         nfetch = min(nfetch, p.slots - nhit);
         int selected = 0;
         for (int e = 0; e < p.experts; ++e) {
@@ -181,7 +191,8 @@ struct MoeSchedule {
                     tvm::ffi::TensorView step, tvm::ffi::TensorView source,
                     tvm::ffi::TensorView destination, tvm::ffi::TensorView copies,
                     tvm::ffi::TensorView counts, tvm::ffi::TensorView stats, tvm::ffi::TensorView fraction, tvm::ffi::TensorView fetch_table,
-                    tvm::ffi::TensorView valid_tokens, int experts, int base, int evict_limit) {
+                    tvm::ffi::TensorView token_buckets, tvm::ffi::TensorView valid_tokens,
+                    int experts, int base, int evict_limit, int policy_tokens) {
         using namespace host;
         RuntimeCheck(ids.ndim() == 2 && weights.ndim() == 2 && weights.size(0) == ids.size(0) &&
                      weights.size(1) == ids.size(1), "schedule routes must be [tokens, top_k]");
@@ -205,7 +216,10 @@ struct MoeSchedule {
         TensorMatcher({1}).with_dtype<int64_t>(i64).with_device<kDLCUDA>(device).verify(step).verify(copies);
         TensorMatcher({4}).with_dtype<int64_t>(i64).with_device<kDLCUDA>(device).verify(counts).verify(stats);
         TensorMatcher({1}).with_dtype<int32_t>(i32).with_device<kDLCUDA>(device).verify(fraction).verify(valid_tokens);
-        TensorMatcher({experts + 1}).with_dtype<int32_t>(i32).with_device<kDLCUDA>(device).verify(fetch_table);
+        auto policies = SymbolicSize{"token policy rows"};
+        TensorMatcher({policies, experts + 1}).with_dtype<int32_t>(i32).with_device<kDLCUDA>(device).verify(fetch_table);
+        TensorMatcher({policies}).with_dtype<int32_t>(i32).with_device<kDLCUDA>(device).verify(token_buckets);
+        RuntimeCheck(policies.unwrap() > 0, "schedule requires at least one policy row");
         RuntimeCheck(experts > 0 && experts <= 4096 && base >= 0 && base + experts <= total.unwrap(), "invalid expert range");
         RuntimeCheck(plan.unwrap() >= experts && slots.unwrap() >= experts, "schedule needs a full layer of slots/descriptors");
         RuntimeCheck(evict_limit >= experts && evict_limit <= slots.unwrap(), "invalid schedule victim range");
@@ -219,8 +233,9 @@ struct MoeSchedule {
             static_cast<int32_t*>(destination.data_ptr()), static_cast<int64_t*>(copies.data_ptr()),
             static_cast<int64_t*>(counts.data_ptr()), static_cast<int64_t*>(stats.data_ptr()), static_cast<const int32_t*>(fraction.data_ptr()),
             static_cast<const int32_t*>(fetch_table.data_ptr()),
+            static_cast<const int32_t*>(token_buckets.data_ptr()), static_cast<int>(policies.unwrap()),
             static_cast<const int32_t*>(valid_tokens.data_ptr()), static_cast<int>(tokens.unwrap()),
-            static_cast<int>(topk.unwrap()), experts, static_cast<int>(slots.unwrap()), evict_limit, base};
+            static_cast<int>(topk.unwrap()), experts, static_cast<int>(slots.unwrap()), evict_limit, base, policy_tokens};
         LaunchKernel(1, 256, device.unwrap(), experts * 3 * sizeof(int))(moe_schedule_kernel, p);
     }
 };

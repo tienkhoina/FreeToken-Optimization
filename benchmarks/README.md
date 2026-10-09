@@ -51,6 +51,18 @@ calibration, startup coverage, disk PLE and real-checkpoint A/B.
 outputs, comparing separate BF16 partial sums with one ordered FP32 route sum
 after warmed graph replay. The single sum must match the unsplit operator bytes.
 
+**`bench_dsv4_shared_expert.py`** — separate versus merged DeepSeek-V4 shared
+gate/up projections, using the production BF16 or block-FP8 operators. Saves
+inputs, weights, outputs, numerical differences and warmed graph timing samples.
+See [DeepSeek-V4 NVFP4 integration](README_deepseek_nvfp4.md) for CPU validation,
+the experimental runtime flags and the GPU validation that remains to be run.
+
+**`bench_dsv4_prefill.py`** — a synthetic three-layer DeepSeek model including
+ratio-0/4/128 attention, testing cold/continued prefills and padded tails. Compares
+the original eager path, same-shape bucket eager execution and graph replay;
+saves logits/state/input tensors and timing samples. The CPU checks and offline
+compilation do not replace running this GPU benchmark.
+
 **`bench_bucket_block_prefill.py`** — 10k/100k input scaling on a small Qwen
 QSA/GDN/PLE model, comparing block-major bucket graphs with native layer sweeps.
 Inputs, logits, final states, graph counts and memory are retained. See

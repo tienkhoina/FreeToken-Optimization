@@ -360,6 +360,29 @@ class Compressor(BaseOP):
         )
         self.attn.scatter_compressed(self.layer_id, self.tier, cmp_dst, compressed.view(B, -1))
 
+    def prefill_bucket(self, x, metadata):
+        from freetoken.kernel.triton.dsv4.prefill import commit_carries, pool_blocks, store_rows
+
+        kv = self.wkv.forward(x.float())
+        score = self.wgate.forward(x.float())
+        reduced = pool_blocks(kv, score, self, metadata, x.dtype)
+        ratio, rd = self.compress_ratio, self.rope_head_dim
+        blocks = torch.arange(reduced.shape[1], device=x.device)
+        valid = blocks < metadata.valid_tokens // ratio
+        positions = torch.where(valid, metadata.prefix_length + blocks * ratio, 0).long()
+        reduced = self.norm.forward(reduced)
+        frequencies = self._freqs_cis.index_select(0, positions)
+        apply_rotary_emb(reduced[..., -rd:], frequencies)
+        if self.rotate:
+            reduced = hadamard_transform(reduced)
+            fp4_act_quant_inplace(reduced, 32)
+        else:
+            act_quant_fp8_inplace(reduced[..., :-rd], 64)
+        rows = metadata.full_snap[0].index_select(0, positions) // ratio
+        store_rows(reduced[0], self.cmp_pool, rows, metadata.valid_tokens // ratio)
+        commit_carries(kv, score, self, metadata)
+        return reduced
+
 
 class Indexer(BaseOP):
     """Lightning Indexer: scores compressed KV and returns top-k positions to attend."""
@@ -442,6 +465,27 @@ class Indexer(BaseOP):
             scores, start_pos=start_pos, seqlen=seqlen, ratio=ratio,
             topk=self.index_topk, offset=offset,
         )
+
+    def prefill_bucket(self, x, qr, metadata, positions):
+        from freetoken.kernel.triton.dsv4.indexer import indexer_decode_logits
+
+        tokens = x.shape[1]
+        ratio, rd = self.compress_ratio, self.rope_head_dim
+        q = self.wq_b.forward(qr).unflatten(-1, (self.n_heads, self.head_dim))
+        apply_rotary_emb(q[..., -rd:], self._freqs_cis.index_select(0, positions))
+        q = hadamard_transform(q)
+        fp4_act_quant_inplace(q, 32)
+        self.compressor.prefill_bucket(x, metadata)
+        weights = self.weights_proj.forward(x) * (self.softmax_scale * self.n_heads ** -0.5)
+        live = torch.where(torch.arange(tokens, device=x.device) < metadata.valid_tokens,
+                           (positions + 1) // ratio, 0).to(torch.int32)
+        stage = metadata.full_snap.shape[1] // ratio
+        scores = torch.empty((tokens, stage), dtype=torch.float32, device=x.device)
+        indexer_decode_logits(q.reshape(tokens, self.n_heads, self.head_dim),
+            weights.reshape(tokens, self.n_heads), self.idx_pool,
+            metadata.full_snap.expand(tokens, -1), live, stage, ratio, out=scores)
+        picks = scores.topk(min(self.index_topk, stage), dim=-1)[1]
+        return torch.where(picks < live[:, None], picks, -1).unsqueeze(0)
 
     def decode_step(
         self, x: torch.Tensor, qr: torch.Tensor, pos: torch.Tensor, offset: int,

@@ -16,8 +16,35 @@ from __future__ import annotations
 from typing import Any
 
 from freetoken.models.config import DSV4AttentionGroupConfig, ModelConfig, RotaryConfig
+from freetoken.layers.quantization import CompressedTensorsConfig, QuantConfig, QuantKind, quantization_config_of
 
 from .args import load_args
+
+
+class DeepseekV4CompressedTensorsConfig(CompressedTensorsConfig):
+    def scheme_for_name(self, name: str):
+        candidates = [name, f"model.{name}"]
+        aliases = {"w1": "gate_proj", "w3": "up_proj", "w2": "down_proj"}
+        parent, _, leaf = name.rpartition(".")
+        if leaf in aliases and ".ffn.experts." in name:
+            candidates.append(f"{parent}.{aliases[leaf]}")
+        if name.endswith((".attn.wq_a", ".attn.wkv")):
+            candidates.append(f"{parent}.fused_wqa_wkv")
+        candidates += [f"model.{candidate}" for candidate in candidates[2:]]
+        if any(self.ignore(candidate) for candidate in candidates):
+            return None
+        schemes = {scheme for candidate in candidates
+                   if (scheme := super(DeepseekV4CompressedTensorsConfig, self).scheme_for_name(candidate)) is not None}
+        if len(schemes) > 1:
+            raise ValueError(f"Conflicting DeepSeek-V4 quantization schemes for {name}: {schemes}")
+        return next(iter(schemes), None)
+
+
+def build_quant_config(hf_config, **kwargs):
+    quant = quantization_config_of(hf_config)
+    if quant and CompressedTensorsConfig.claims(quant):
+        return DeepseekV4CompressedTensorsConfig(quant, hf_config, **kwargs)
+    return QuantConfig.from_hf(hf_config, **kwargs)
 
 
 def parse_config(hf_config: Any) -> ModelConfig:
@@ -29,6 +56,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
             "DeepSeek-V4 parse_config needs the checkpoint path (hf_config._name_or_path)"
         )
     args = load_args(model_path, max_batch_size=1)
+    expert_scheme = build_quant_config(hf_config).scheme_for_name("layers.0.ffn.experts.0.w1")
 
     rope_scaling = {
         "rope_type": "yarn",
@@ -71,7 +99,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         model_type="deepseek_v4",
         architectures=["DeepseekV4ForCausalLM"],
         moe_enabled=True,
-        expert_quant="ds_fp4",
+        expert_quant="nvfp4" if expert_scheme is not None and expert_scheme.kind is QuantKind.NVFP4 else "ds_fp4",
         # NB: DSV4 has MoE on every layer (no dense-replace) and reads its routing /
         # shared-expert / scaling config from dsv4_args, so the generic DeepSeek-family
         # MoE ModelConfig fields (first_k_dense_replace / n_shared_experts /

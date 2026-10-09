@@ -52,6 +52,10 @@ class EngineConfig:
     moe_prefill_graph_max_tokens: int = 256
     qwen_prefill_mode: str = "bucket"
     qwen_prefill_activation_device: str = "auto"
+    dsv4_fuse_shared_expert: bool = False
+    dsv4_prefill_mode: str = "eager"
+    dsv4_prefill_buckets: tuple[int, ...] | None = None
+    dsv4_prefill_context_buckets: tuple[int, ...] | None = None
     moe_prefill_overlap: bool = True
     # Prefill hit/miss split: serve cache-resident experts D2D during prefill
     # prefetch instead of re-streaming the full layer over PCIe. Needs CUDA >= 12.8

@@ -833,7 +833,8 @@ class Engine:
         # round a batch up to the largest captured size; cover both.
         max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, 1)
         if config.moe_native_schedule:
-            max_tokens = max(max_tokens, config.moe_prefill_graph_max_tokens or getattr(config, "max_extend_tokens", 8192))
+            max_tokens = max(max_tokens, config.moe_prefill_graph_max_tokens,
+                             getattr(config, "max_extend_tokens", 8192))
         executor = CpuMoeExecutor(
             cache,
             top_k=sample.top_k,
@@ -1249,6 +1250,7 @@ def _adjust_dsv4_config(config: EngineConfig, override) -> None:
     model_config = config.model_config
     model_config.dsv4_args.max_seq_len = config.max_seq_len
     model_config.dsv4_args.max_batch_size = config.max_running_req + 1  # +1 dummy
+    model_config.dsv4_args.fuse_shared_expert = config.dsv4_fuse_shared_expert
     # config.swa_full_tokens_ratio is the DSV4 window/full ratio directly (default sizing);
     # a runtime rebuild pins an absolute window via swa_num_pages_override instead.
     # DSV4's KV page IS the P-token window page (window == radix reuse granularity == lcm of
@@ -1264,7 +1266,7 @@ def _adjust_dsv4_config(config: EngineConfig, override) -> None:
     # honored, as is an explicit 'naive'. Don't let max_extend_tokens force a second chunk within
     # one prompt (the pool's prefill_chunk_budget still chunks prompts larger than the window
     # pool); prefill batches ragged (bs>=1), each segment resuming from its own cached_len.
-    if getattr(config, "max_extend_tokens", 0) < config.max_seq_len:
+    if config.dsv4_prefill_mode != "bucket" and getattr(config, "max_extend_tokens", 0) < config.max_seq_len:
         override("max_extend_tokens", config.max_seq_len)
 
     # DSV4 decode batches at most max_running_req rows; its full-loc snapshot is sized to that,
@@ -1530,6 +1532,20 @@ def _adjust_config(config: EngineConfig):
     has_linear_attention = getattr(model_config, "has_linear_attention", False)
     is_moe = getattr(model_config, "is_moe", False)
     expert_quant = getattr(model_config, "expert_quant", "none")
+
+    if config.dsv4_fuse_shared_expert and not is_dsv4:
+        raise ValueError("--dsv4-fuse-shared-expert requires a DeepSeek-V4 model")
+    if config.dsv4_prefill_mode not in ("eager", "bucket"):
+        raise ValueError("dsv4_prefill_mode must be eager or bucket")
+    if config.dsv4_prefill_mode == "bucket":
+        if not is_dsv4 or not config.moe_native_schedule or expert_quant != "nvfp4":
+            raise ValueError("DeepSeek bucket prefill requires DeepSeek NVFP4 and --moe-native-schedule")
+        from .dsv4_prefill import bucket_shapes
+
+        shapes = bucket_shapes(config)
+        override("max_extend_tokens", min(getattr(config, "max_extend_tokens", 8192), max(token for token, _ in shapes)))
+        if config.max_running_req != 1:
+            logger.info_rank0("DeepSeek bucket prefill covers one-request batches; ragged multi-request prefill stays eager")
 
     if not is_moe:
         # A dense model has no routed experts: the MoE knobs are inert, and the offload family
@@ -1844,13 +1860,13 @@ def _adjust_config(config: EngineConfig):
             raise ValueError("qwen_prefill_mode must be exact, bucket, block or layer")
         if config.qwen_prefill_activation_device not in ("auto", "gpu", "cpu"):
             raise ValueError("qwen_prefill_activation_device must be auto, gpu or cpu")
-        if not qwen_prefill and (config.attention_backend.split(",")[0] != "triton" or has_linear_attention or model_config.model_is_mrope):
+        if not qwen_prefill and not is_dsv4 and (config.attention_backend.split(",")[0] != "triton" or has_linear_attention or model_config.model_is_mrope):
             raise ValueError("native scheduled prefill graphs require Triton paged attention without linear/mrope state")
         if qwen_prefill and config.qwen_prefill_mode == "layer":
             if config.moe_prefill_graph_max_tokens < 64:
                 raise ValueError("layer prefill needs an explicit block cap of at least 64")
             override("max_extend_tokens", config.max_seq_len)
-        elif config.moe_prefill_graph_max_tokens:
+        elif config.moe_prefill_graph_max_tokens and not is_dsv4:
             bucket_cap = 1 << (config.moe_prefill_graph_max_tokens.bit_length() - 1)
             override("max_extend_tokens", min(getattr(config, "max_extend_tokens", 8192), bucket_cap))
 

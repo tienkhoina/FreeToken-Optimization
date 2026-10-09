@@ -23,6 +23,7 @@ class DeepseekV4Args:
     scale_fmt: Literal[None, "ue8m0"] = "ue8m0"
     expert_dtype: Literal[None, "fp4"] = "fp4"
     scale_dtype: Literal["fp32", "fp8"] = "fp8"
+    fuse_shared_expert: bool = False
 
     # ----- shape -----
     vocab_size: int = 129280
@@ -80,32 +81,53 @@ class DeepseekV4Args:
 
 
 def _config_path(model_path: str) -> str:
-    """Locate the authors' ModelArgs JSON inside the checkpoint directory."""
+    """Prefer the reference ModelArgs JSON, falling back to a Hugging Face export."""
     candidates = [
         os.path.join(model_path, "inference", "config.json"),
         os.path.join(model_path, "model_args.json"),
+        os.path.join(model_path, "config.json"),
     ]
     for path in candidates:
         if os.path.exists(path):
             return path
     raise FileNotFoundError(
         f"No DeepSeek-V4 ModelArgs JSON found under {model_path} "
-        f"(looked for inference/config.json)"
+        f"(looked for inference/config.json, model_args.json and config.json)"
     )
 
 
 def load_args(model_path: str, **overrides) -> DeepseekV4Args:
-    """Build :class:`DeepseekV4Args` from the checkpoint's ``inference/config.json``.
+    """Build :class:`DeepseekV4Args` from reference or Hugging Face configuration.
 
     ``overrides`` (e.g. ``max_seq_len``, ``max_batch_size``) take precedence over the
     file, letting the runner size the per-request caches.
     """
     with open(_config_path(model_path)) as f:
         raw = json.load(f)
+    if "model_type" in raw:
+        if raw["model_type"] != "deepseek_v4":
+            raise ValueError(f"Expected deepseek_v4 config, got {raw['model_type']!r}")
+        aliases = {
+            "hidden_size": "dim", "moe_intermediate_size": "moe_inter_dim",
+            "num_hidden_layers": "n_layers", "num_hash_layers": "n_hash_layers",
+            "num_nextn_predict_layers": "n_mtp_layers", "num_attention_heads": "n_heads",
+            "num_experts_per_tok": "n_activated_experts", "scoring_func": "score_func",
+            "routed_scaling_factor": "route_scale", "qk_rope_head_dim": "rope_head_dim",
+            "rms_norm_eps": "norm_eps", "sliding_window": "window_size",
+        }
+        raw = {aliases.get(key, key): value for key, value in raw.items()}
+        rope = raw.get("rope_scaling") or raw.get("rope_parameters") or {}
+        for source, target in (("factor", "rope_factor"), ("original_max_position_embeddings", "original_seq_len"),
+                               ("beta_fast", "beta_fast"), ("beta_slow", "beta_slow")):
+            if source in rope:
+                raw[target] = rope[source]
     valid = {f.name for f in fields(DeepseekV4Args)}
     kwargs = {k: v for k, v in raw.items() if k in valid}
     kwargs.update(overrides)
-    return DeepseekV4Args(**kwargs)
+    args = DeepseekV4Args(**kwargs)
+    if len(args.compress_ratios) < args.n_layers:
+        raise ValueError(f"compress_ratios has {len(args.compress_ratios)} entries for {args.n_layers} layers")
+    return args
 
 
 __all__ = ["DeepseekV4Args", "load_args"]

@@ -189,6 +189,9 @@ class CpuMoeExecutor:
         self.num_layers = int(cache.num_layers)
         self.num_experts = int(cache.num_experts)
         self.top_k = int(top_k)
+        self.activation = activation
+        self.swiglu_alpha = float(swiglu_alpha)
+        self.swiglu_limit = swiglu_limit
         self.quant_format = fmt
         self.device = device
         self.max_tokens = int(max_tokens)
