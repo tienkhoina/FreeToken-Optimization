@@ -79,6 +79,43 @@ timing samples from warmed graphs. It requires byte equality with the unsplit
 NVFP4 operator and reports the earlier separate-partial rounding error. It
 isolates expert math/reduction; copy scheduling is measured by the server A/B.
 
+## H100 NVFP4 measurements
+
+The 2026-10-09 microbenchmark used an H100 80GB and a Xeon Platinum 8462Y+ with
+16 CPU workers. GEMM rates below are general FP32/BF16 baselines, not NVFP4
+throughput. The expert operator used synthetic Qwen-shaped NVFP4 banks, not
+checkpoint weights.
+
+| Measurement | CPU | H100 |
+|---|---:|---:|
+| GEMM FP32, 6144 x 6144 | 1.812 TFLOP/s | 51.06 TFLOP/s |
+| GEMM BF16, 6144 x 6144 | 1.274 TFLOP/s | 800.54 TFLOP/s |
+| RAM streaming read, 2 GiB | 181.0 GB/s | n/a |
+| Pinned RAM -> VRAM | n/a | 55.32 GB/s |
+| VRAM -> pinned RAM | n/a | 55.31 GB/s |
+
+With H=2560, I=640, top-k=10 and 16 synthetic experts, warmed NVFP4 operator
+latencies were:
+
+| Query tokens | Unsplit | Hit/fetch with ordered reduction | Effective expert rate |
+|---:|---:|---:|---:|
+| 1 | 37.536 us | 50.304 us | 2.62 TFLOP/s |
+| 39 | 527.232 us | 695.680 us | 7.27 TFLOP/s |
+| 64 | 740.128 us | 769.824 us | 8.50 TFLOP/s |
+
+One expert occupies 2,772,480 bytes (2.644 MiB) in the FreeToken NVFP4 bank
+layout. At the measured pinned-copy rate, ten experts require about 0.501 ms
+for a linear transfer; the measured gather graph took 0.560 ms for ten misses.
+For the synthetic CPU/GPU calibration, the 10-miss CPU task took 2.221 ms and
+its complete CPU branch graph took 3.773 ms, versus 0.0394 ms for GPU NVFP4
+math. Those CPU timings are diagnostic only: CPU/GPU output relative L2 error
+was about 0.99999, so they do not establish valid CPU NVFP4 throughput or a
+usable split ratio.
+
+These are microbenchmarks under a shared host load, not whole-model serving
+results. Methodology and limitations are in
+[the detailed H100 report](README_qwen_nvfp4_h100.md).
+
 ## Measured checkpoint result
 
 On RTX A5000 24 GiB with 64 allowed CPU workers, Qwen NVFP4 revision

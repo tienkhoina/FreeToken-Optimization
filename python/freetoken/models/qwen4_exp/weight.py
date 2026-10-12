@@ -49,6 +49,18 @@ _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     layer_to_bank=lambda layer, config: layer,  # every layer is MoE
     desc="Qwen3.8-Flash-Next NVFP4 experts",
 )
+_COMPRESSED_TENSORS_NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
+    key_pattern=re.compile(
+        r"^model\.language_model\.layers\.(?P<layer>\d+)\.mlp\.experts\."
+        r"(?P<expert>\d+)\.(?P<proj>gate_proj|up_proj|down_proj)\."
+        r"(?P<kind>weight_packed|weight_scale|weight_global_scale)$"
+    ),
+    proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
+    layer_to_bank=lambda layer, config: layer,
+    desc="Qwen3.8-Flash-Next compressed-tensors NVFP4 experts",
+    kind_map={"weight_packed": "weight", "weight_global_scale": "weight_scale_2"},
+    global_reciprocal=True,
+)
 # Per-tensor modelopt quant scales; consumed with their ``.weight`` (experts) or unused.
 _SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2", ".input_scale")
 
@@ -383,6 +395,9 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
 
 
 def nvfp4_expert_spec(model_path: str, config):
+    quant = get_quant_config()
+    if quant is not None and type(quant).__name__ == "CompressedTensorsConfig":
+        return _COMPRESSED_TENSORS_NVFP4_SOURCE_SPEC
     return _NVFP4_SOURCE_SPEC
 
 

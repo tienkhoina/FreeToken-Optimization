@@ -50,6 +50,8 @@ calibration, startup coverage, disk PLE and real-checkpoint A/B.
 **`bench_nvfp4_route_merge.py`** — saved random NVFP4 expert inputs, banks and
 outputs, comparing separate BF16 partial sums with one ordered FP32 route sum
 after warmed graph replay. The single sum must match the unsplit operator bytes.
+See [Qwen NVFP4 H100 microbenchmark](README_qwen_nvfp4_h100.md) for measured
+CPU/GPU GEMM, pinned RAM-to-VRAM copy rates and synthetic Qwen expert timings.
 
 **`bench_dsv4_shared_expert.py`** — separate versus merged DeepSeek-V4 shared
 gate/up projections, using the production BF16 or block-FP8 operators. Saves
